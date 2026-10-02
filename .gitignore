@@ -1,0 +1,31 @@
+# binarios compilados
+spathad
+libspatha
+probe5
+probe_api
+*.o
+*.a
+
+# backups de parches
+*.pre-v12
+*.pre-v7
+*.orig
+*.rej
+
+# temporales
+*.log
+*.tmp
+*.swp
+
+# directorios de build
+build/
+out/
+dist/
+
+# ruido local / otros proyectos
+.exmu-cfg1.data
+sesar-shell.c
+Pd2.sh
+pd2.sh
+fix.sh
+spatha_cmds.icd
