@@ -48,6 +48,9 @@ backend DRM que Android no expone.
   GetPhysicalDeviceFeatures2: las properties y features de 1.1 y 1.2
   llegan completas, filtradas por máscara para lo que el ICD no puede
   cumplir.
+- **Present con MIT-SHM opcional**: swapchain usa memfd + `xcb_shm_attach_fd`
+  (SHM 1.2) cuando el X server lo soporta; si no, cae a `xcb_put_image`.
+  +24% a +69% medido sobre Mali-G52 MC2 (ver más abajo).
 - **Replay de command buffers** sobre el device real del daemon.
 
 Verificado con probe_api: **19/19 PASS** cubriendo instancia 1.2,
@@ -167,8 +170,52 @@ Variables de entorno del cliente:
 - SPATHA_SOCK: path al socket. Default /tmp/spatha.sock.
 - SPATHA_ICD_DAEMON: off | try | require. Default off.
 - SPATHA_DEBUG: 1 imprime trazas a stderr.
+- SPATHA_NOSHM: 1 desactiva MIT-SHM y fuerza el camino `xcb_put_image`.
 - SPATHA_VK_LIB (solo daemon): loader Android. Default
   /system/lib64/libvulkan.so.
+
+## Present: SHM vs put_image
+
+Dos caminos de present, el ICD elige uno automáticamente:
+
+- **SHM** (default si el server soporta SHM 1.2): 2 segmentos `memfd_create`
+  en ping-pong, attachados con `xcb_shm_attach_fd`. Cada present manda ~32
+  bytes de header; el server lee los píxeles directo del mmap.
+- **put_image** (fallback): el ICD recibe el frame en `malloc`, lo trocea
+  según `max_req_len` y lo manda en múltiples writes. Varios `memcpy` por
+  frame, todos evitables.
+
+`SPATHA_NOSHM=1` fuerza el fallback.
+
+### Números medidos
+
+Mali-G52 MC2 / Termux:X11, `vkmark --winsys xcb -p immediate`, 3 s cube +
+5 s effect2d, una corrida por celda.
+
+| Resolución | Modo  | cube FPS | effect2d FPS | Score |
+|------------|-------|---------:|-------------:|------:|
+| 640×360    | SHM   |      104 |           63 |    83 |
+| 640×360    | NOSHM |       61 |           58 |    59 |
+| 854×480    | SHM   |       75 |           59 |    67 |
+| 854×480    | NOSHM |       58 |           51 |    54 |
+| 1280×720   | SHM   |       59 |           38 |    48 |
+| 1280×720   | NOSHM |       46 |           24 |    35 |
+| 1920×1080  | SHM   |       33 |           21 |    27 |
+| 1920×1080  | NOSHM |       20 |           12 |    16 |
+
+Delta del score: **+41% / +24% / +37% / +69%** (360p / 480p / 720p / 1080p).
+La ganancia escala con la resolución, consistente con el modelo: el overhead
+de NOSHM crece lineal con los píxeles, SHM queda en ~32 bytes fijos por
+frame.
+
+Con `vkcube --c 600` a 800×600: SHM ~101 FPS vs NOSHM ~83 FPS (+22%).
+
+### Límite conocido: 4K
+
+`SPATHA_MAX_PAYLOAD` en `proto.h` es 16 MB. Un frame 3840×2160 RGBA8 son
+~31.6 MB, así que el daemon rechaza el present con
+`VK_ERROR_OUT_OF_HOST_MEMORY`. 1920×1080 (8.3 MB) entra sin problema.
+Subir el límite es trivial pero cuadruplica los buffers de wire.
 
 ## Licencia
 
