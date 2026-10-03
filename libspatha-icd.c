@@ -19,6 +19,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/mman.h>
+#include <sys/syscall.h>
 #include <vulkan/vulkan.h>
 #include <vulkan/vk_icd.h>
 #include "proto.h"
@@ -1418,13 +1420,41 @@ static struct {
                            uint8_t, uint8_t, uint32_t, const uint8_t *);
     int (*flush)(void *);
     uint32_t (*max_req_len)(void *);
+    void *(*request_check)(void *, sx_cookie);
 } X;
+
+/* ---- MIT-SHM opcional: memfd + xcb_shm_attach_fd (SHM 1.2). Si algo falla en
+ * cualquier punto se vuelve a xcb_put_image. SPATHA_NOSHM=1 lo desactiva. ---- */
+typedef struct { uint8_t response_type, shared_pixmaps; uint16_t sequence; uint32_t length;
+                 uint16_t major, minor, uid, gid; uint8_t pixmap_format, pad[15]; } sx_shm_ver_reply;
+static struct {
+    void *lib;
+    sx_cookie (*query_version)(void *);
+    sx_shm_ver_reply *(*query_version_reply)(void *, sx_cookie, void *);
+    sx_cookie (*attach_fd_checked)(void *, uint32_t, int, uint8_t);
+    sx_cookie (*put_image_checked)(void *, uint32_t, uint32_t, uint16_t, uint16_t, uint16_t, uint16_t,
+                                   uint16_t, uint16_t, int16_t, int16_t, uint8_t, uint8_t, uint8_t,
+                                   uint32_t, uint32_t);
+    sx_cookie (*put_image)(void *, uint32_t, uint32_t, uint16_t, uint16_t, uint16_t, uint16_t,
+                           uint16_t, uint16_t, int16_t, int16_t, uint8_t, uint8_t, uint8_t,
+                           uint32_t, uint32_t);
+    sx_cookie (*detach)(void *, uint32_t);
+} XS;
 static pthread_mutex_t g_x_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void *dl_try(const char *const *names) {
+    for (int i = 0; names[i]; i++) {
+        void *h = dlopen(names[i], RTLD_NOW | RTLD_GLOBAL);
+        if (h) return h;
+    }
+    return NULL;
+}
 
 static int x_load(void) {
     pthread_mutex_lock(&g_x_lock);
     if (!X.lib) {
-        void *l = dlopen("libxcb.so.1", RTLD_NOW | RTLD_GLOBAL);
+        static const char *const cand[] = { "libxcb.so.1", "libxcb.so", NULL };
+        void *l = dl_try(cand);
         if (!l) { DBG("dlopen libxcb.so.1: %s", dlerror()); pthread_mutex_unlock(&g_x_lock); return 0; }
         X.get_geometry = dlsym(l, "xcb_get_geometry");
         X.get_geometry_reply = dlsym(l, "xcb_get_geometry_reply");
@@ -1434,6 +1464,7 @@ static int x_load(void) {
         X.put_image = dlsym(l, "xcb_put_image");
         X.flush = dlsym(l, "xcb_flush");
         X.max_req_len = dlsym(l, "xcb_get_maximum_request_length");
+        X.request_check = dlsym(l, "xcb_request_check");
         if (!X.get_geometry || !X.get_geometry_reply || !X.generate_id || !X.create_gc || !X.free_gc ||
             !X.put_image || !X.flush || !X.max_req_len) { DBG("libxcb incompleta"); pthread_mutex_unlock(&g_x_lock); return 0; }
         X.lib = l;
@@ -1552,6 +1583,28 @@ static VKAPI_ATTR VkBool32 VKAPI_CALL
 stub_vkGetPhysicalDeviceXcbPresentationSupportKHR(VkPhysicalDevice pd, uint32_t family, void *conn, uint32_t visual)
 { (void)pd; (void)family; (void)conn; (void)visual; return VK_TRUE; }
 
+
+static int xs_load(void) {
+    pthread_mutex_lock(&g_x_lock);
+    if (!XS.lib) {
+        static const char *const cand[] = { "libxcb-shm.so.0", "libxcb-shm.so", NULL };
+        void *l = dl_try(cand);
+        if (l) {
+            XS.query_version = dlsym(l, "xcb_shm_query_version");
+            XS.query_version_reply = dlsym(l, "xcb_shm_query_version_reply");
+            XS.attach_fd_checked = dlsym(l, "xcb_shm_attach_fd_checked");
+            XS.put_image_checked = dlsym(l, "xcb_shm_put_image_checked");
+            XS.put_image = dlsym(l, "xcb_shm_put_image");
+            XS.detach = dlsym(l, "xcb_shm_detach");
+            if (XS.query_version && XS.query_version_reply && XS.attach_fd_checked &&
+                XS.put_image_checked && XS.put_image && XS.detach && X.request_check) XS.lib = l;
+        }
+        if (!XS.lib) DBG("MIT-SHM: libxcb-shm no disponible");
+    }
+    pthread_mutex_unlock(&g_x_lock);
+    return XS.lib != NULL;
+}
+
 struct spatha_swapchain {
     struct spatha_device *dev;
     uint64_t remote_id;
@@ -1560,9 +1613,51 @@ struct spatha_swapchain {
     uint8_t depth;
     VkFormat fmt;
     uint64_t img_id[8];
-    uint8_t *frame;                 /* buffer de respuesta de present */
+    uint8_t *frame;                 /* buffer de respuesta de present (malloc, o NULL con SHM) */
     size_t frame_cap;
+    int nshm, shm_cur, shm_verified; /* 2 segmentos memfd en ping-pong */
+    uint8_t *shm_buf[2];
+    uint32_t shm_seg[2];
 };
+
+static void shm_teardown(struct spatha_swapchain *sc) {
+    void *conn = sc->surf->connection;
+    for (int i = 0; i < sc->nshm; i++) {
+        if (XS.lib && X.lib) XS.detach(conn, sc->shm_seg[i]);
+        munmap(sc->shm_buf[i], sc->frame_cap);
+        sc->shm_buf[i] = NULL;
+    }
+    if (sc->nshm && X.lib) X.flush(conn);
+    sc->nshm = 0;
+}
+
+/* Devuelve 1 si quedaron 2 segmentos listos. Deja el swapchain intacto si falla. */
+static int shm_setup(struct spatha_swapchain *sc) {
+    if (getenv("SPATHA_NOSHM") || !xs_load()) return 0;
+    void *conn = sc->surf->connection;
+    sx_shm_ver_reply *vr = XS.query_version_reply(conn, XS.query_version(conn), NULL);
+    int okv = vr && vr->major == 1 && vr->minor >= 2;   /* attach_fd llego en SHM 1.2 */
+    DBG("MIT-SHM %s (%u.%u)", okv ? "ok" : "sin fd-passing", vr ? vr->major : 0, vr ? vr->minor : 0);
+    free(vr);
+    if (!okv) return 0;
+    for (int i = 0; i < 2; i++) {
+        int fd = (int)syscall(SYS_memfd_create, "spatha-frame", 1u /* MFD_CLOEXEC */);
+        if (fd < 0) { DBG("memfd_create: %s", strerror(errno)); goto fail; }
+        if (ftruncate(fd, (off_t)sc->frame_cap) < 0) { close(fd); goto fail; }
+        void *m = mmap(NULL, sc->frame_cap, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+        int xfd = (m == MAP_FAILED) ? -1 : dup(fd);   /* xcb se queda con el fd que le pasamos */
+        close(fd);
+        if (xfd < 0) { if (m != MAP_FAILED) munmap(m, sc->frame_cap); goto fail; }
+        uint32_t seg = X.generate_id(conn);
+        void *err = X.request_check(conn, XS.attach_fd_checked(conn, seg, xfd, 1));
+        if (err) { free(err); munmap(m, sc->frame_cap); DBG("shm_attach_fd rechazado"); goto fail; }
+        sc->shm_buf[i] = m; sc->shm_seg[i] = seg; sc->nshm = i + 1;
+    }
+    return 1;
+fail:
+    shm_teardown(sc);
+    return 0;
+}
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 stub_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci, const VkAllocationCallbacks *a, VkSwapchainKHR *out)
@@ -1595,10 +1690,11 @@ stub_vkCreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci, c
     sc->depth = depth; sc->fmt = ci->imageFormat;
     for (uint64_t i = 0; i < n; i++) sc->img_id[i] = r_u64(&r);
     sc->frame_cap = 8 + 16 + (size_t)w * h * 4 + 64;
-    sc->frame = malloc(sc->frame_cap);
     sc->gc = X.generate_id(s->connection);
     X.create_gc(s->connection, sc->gc, s->window, 0, NULL);
-    if (!sc->frame) {
+    int use_shm = shm_setup(sc);
+    if (!use_shm) sc->frame = malloc(sc->frame_cap);
+    if (!use_shm && !sc->frame) {
         struct wbuf dw; w_init(&dw); w_u64(&dw, d->remote_id); w_u64(&dw, sid);
         alignas(8) uint8_t rs[16]; size_t l2; vcall(d->inst, SPATHA_OP_DESTROY_SWAPCHAIN, &dw, rs, sizeof(rs), &l2);
         w_free(&dw); free(sc);
@@ -1621,6 +1717,7 @@ stub_vkDestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAl
     vcall(d->inst, SPATHA_OP_DESTROY_SWAPCHAIN, &w, resp, sizeof(resp), &rl);
     w_free(&w);
     if (X.lib) { X.free_gc(sc->surf->connection, sc->gc); X.flush(sc->surf->connection); }
+    shm_teardown(sc);
     free(sc->frame); free(sc);
 }
 
@@ -1667,13 +1764,37 @@ static VkResult present_one(struct spatha_queue *q, struct spatha_swapchain *sc,
     w_u64(&w, d->remote_id); w_u64(&w, q->remote_id); w_u64(&w, sc->remote_id); w_u64(&w, idx); w_u64(&w, nwait);
     for (uint32_t i = 0; i < nwait; i++) w_u64(&w, ID(wait[i]));
     size_t rl = 0;
-    VkResult vr = vcall(d->inst, SPATHA_OP_QUEUE_PRESENT, &w, sc->frame, sc->frame_cap, &rl);
+    uint8_t *buf = sc->nshm ? sc->shm_buf[sc->shm_cur] : sc->frame;
+    VkResult vr = vcall(d->inst, SPATHA_OP_QUEUE_PRESENT, &w, buf, sc->frame_cap, &rl);
     w_free(&w);
     if (vr != VK_SUCCESS) return vr;
     size_t need = 8 + 16 + (size_t)sc->w * sc->h * 4;
     if (rl < need) return VK_ERROR_DEVICE_LOST;
-    const uint8_t *px = sc->frame + 8 + 16;
+    const uint8_t *px = buf + 8 + 16;
     void *conn = sc->surf->connection;
+    if (sc->nshm) {
+        uint32_t seg = sc->shm_seg[sc->shm_cur];
+        if (!sc->shm_verified) {
+            void *err = X.request_check(conn, XS.put_image_checked(conn, sc->surf->window, sc->gc,
+                (uint16_t)sc->w, (uint16_t)sc->h, 0, 0, (uint16_t)sc->w, (uint16_t)sc->h, 0, 0,
+                sc->depth, 2, 0, seg, 8 + 16));
+            if (!err) { sc->shm_verified = 1; DBG("MIT-SHM activo"); sc->shm_cur ^= 1; return VK_SUCCESS; }
+            free(err);
+            DBG("shm_put_image rechazado: vuelvo a put_image");
+            uint8_t *keep = malloc(sc->frame_cap);
+            if (!keep) return VK_ERROR_OUT_OF_HOST_MEMORY;
+            memcpy(keep, buf, need);
+            shm_teardown(sc);
+            sc->frame = keep;
+            px = keep + 8 + 16;
+        } else {
+            XS.put_image(conn, sc->surf->window, sc->gc, (uint16_t)sc->w, (uint16_t)sc->h, 0, 0,
+                         (uint16_t)sc->w, (uint16_t)sc->h, 0, 0, sc->depth, 2, 0, seg, 8 + 16);
+            X.flush(conn);
+            sc->shm_cur ^= 1;
+            return VK_SUCCESS;
+        }
+    }
     size_t stride = (size_t)sc->w * 4;
     size_t maxb = (size_t)X.max_req_len(conn) * 4;
     size_t rows = maxb > 64 + stride ? (maxb - 64) / stride : 1;

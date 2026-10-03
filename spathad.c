@@ -1701,18 +1701,22 @@ static int h_present(struct client *c, const struct spatha_msg *m, const uint8_t
                                    .size = VK_WHOLE_SIZE };
         D.InvalidateMappedMemoryRanges(V.dev, 1, &mr);
     }
+    /* Envio directo desde el buffer mapeado: sin malloc ni memcpy intermedios.
+     * Formato igual que reply_data: [res i32 + pad][w u64][h u64][pixeles]. */
     size_t pix = (size_t)s->w * s->h * 4;
-    outlen = 16 + pix;
-    out = malloc(outlen);
-    if (!out) oom();
-    uint64_t dims[2] = { s->w, s->h };
-    memcpy(out, dims, 16);
-    memcpy(out + 16, s->rb_map, pix);
+    if (8 + 16 + pix > SPATHA_MAX_PAYLOAD) { vr = VK_ERROR_OUT_OF_HOST_MEMORY; goto done; }
+    {
+        struct { struct spatha_msg h; int32_t res; uint32_t pad; uint64_t dims[2]; } pre;
+        pre.h = (struct spatha_msg){ SPATHA_MAGIC, m->op, (uint32_t)(8 + 16 + pix), m->req_id };
+        pre.res = VK_SUCCESS; pre.pad = 0; pre.dims[0] = s->w; pre.dims[1] = s->h;
+        ar_free(c);
+        int rc = spatha_write_all(c->fd, &pre, sizeof(pre));
+        if (rc == 0) rc = spatha_write_all(c->fd, s->rb_map, pix);
+        return rc;
+    }
 done:;
     ar_free(c);
-    int rc = reply_data(c, m, vr, out, outlen);
-    free(out);
-    return rc;
+    return reply_data(c, m, vr, out, outlen);
 }
 
 static int dispatch_op(struct client *c, const struct spatha_msg *m, const uint8_t *payload);
