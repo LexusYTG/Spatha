@@ -42,7 +42,7 @@ enum daemon_mode { MODE_OFF, MODE_TRY, MODE_REQUIRE };
 
 static enum daemon_mode get_mode(void) {
     const char *m = getenv("SPATHA_ICD_DAEMON");
-    if (!m) return MODE_OFF;
+    if (!m) return MODE_REQUIRE;
     if (!strcmp(m, "require")) return MODE_REQUIRE;
     if (!strcmp(m, "try"))     return MODE_TRY;
     return MODE_OFF;

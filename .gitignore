@@ -1,31 +1,19 @@
-# binarios compilados
-spathad
-libspatha
-probe5
-probe_api
+# Binarios compilados — se publican como GitHub Releases
+/glibc/libspatha-icd.so
+/glibc/libspatha
+/glibc/probe_api
+/glibc/probe5
+/glibc/shmtest
+/bionic/spathad
+# Por si quedan en el root
+/libspatha-icd.so
+/libspatha
+/probe_api
+/probe5
+/shmtest
+/spathad
 *.o
 *.a
-
-# backups de parches
-*.pre-v12
-*.pre-v7
-*.orig
-*.rej
-
-# temporales
 *.log
-*.tmp
-*.swp
-
-# directorios de build
-build/
-out/
-dist/
-
-# ruido local / otros proyectos
-.exmu-cfg1.data
-sesar-shell.c
-Pd2.sh
-pd2.sh
-fix.sh
-spatha_cmds.icd
+*.so.fixed
+*.bin
