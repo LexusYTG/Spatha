@@ -159,4 +159,4 @@ export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/spatha_icd.json
 
 ## License
 
-MIT. See `LICENSE`.
+**GPL-3.0**. See `LICENSE`.
